@@ -1,4 +1,3 @@
-import torch
 from pathlib import Path
 from whisperspeech.pipeline import Pipeline
 import torchaudio
