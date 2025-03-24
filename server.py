@@ -7,6 +7,18 @@ from fastapi.responses import FileResponse
 import uvicorn
 import numpy as np
 from typing import Dict
+import logging
+from datetime import datetime
+import wave
+from fastapi import WebSocketDisconnect
+import io
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -18,32 +30,67 @@ tts_connections: Dict[str, WebSocket] = {}
 async def websocket_stt_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
     stt_connections[client_id] = websocket
+    logger.info(f"STT Client connected: {client_id}")
     try:
         while True:
             # Receive audio data as bytes
             audio_data = await websocket.receive_bytes()
+            logger.info(f"STT Request from {client_id}:")
+            logger.info(f"  └─ Received audio: {len(audio_data)} bytes")
             
-            # Convert to numpy array and transcribe
-            audio_np = np.frombuffer(audio_data, dtype=np.float32)
-            segments, info = whisper_model.transcribe(audio_np)
-            text = " ".join([segment.text for segment in segments])
+            # Convert raw PCM to WAV
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)  # Mono audio from Unity
+                wav_file.setsampwidth(2)  # 16-bit audio
+                wav_file.setframerate(48000)  # Unity's sample rate
+                wav_file.writeframes(audio_data)
             
-            # Send back transcription
-            await websocket.send_json({"text": text})
+            # Save temporary WAV file
+            temp_path = f"temp_{client_id}.wav"
+            with open(temp_path, "wb") as f:
+                f.write(wav_buffer.getvalue())
+            
+            try:
+                # Transcribe from file
+                logger.info(f"Processing audio file: {temp_path}")
+                segments, info = whisper_model.transcribe(temp_path)
+                text = " ".join([segment.text for segment in segments])
+                
+                if not text.strip():
+                    text = "[No speech detected]"
+                
+                # Send back transcription
+                response = {"text": text}
+                await websocket.send_json(response)
+                logger.info(f"STT Response to {client_id}:")
+                logger.info(f"  └─ Transcribed text: {text}")
+                
+            finally:
+                # Clean up
+                if Path(temp_path).exists():
+                    Path(temp_path).unlink()
+                    
     except Exception as e:
-        print(f"Error in STT websocket: {e}")
+        logger.error(f"STT Error for {client_id}: {str(e)}")
+        logger.exception("Full traceback:")
     finally:
-        del stt_connections[client_id]
+        if client_id in stt_connections:
+            del stt_connections[client_id]
+        logger.info(f"STT Client disconnected: {client_id}")
 
 @app.websocket("/tts/ws/{client_id}")
 async def websocket_tts_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
     tts_connections[client_id] = websocket
+    logger.info(f"TTS Client connected: {client_id}")
     try:
         while True:
             # Receive text
             data = await websocket.receive_json()
             text = data["text"]
+            logger.info(f"TTS Request from {client_id}:")
+            logger.info(f"  └─ Input text: {text}")
             
             # Generate audio
             audio_tensor = tts_model.generate(text)
@@ -51,10 +98,13 @@ async def websocket_tts_endpoint(websocket: WebSocket, client_id: str):
             # Convert to bytes and send
             audio_data = audio_tensor.cpu().numpy().tobytes()
             await websocket.send_bytes(audio_data)
+            logger.info(f"TTS Response to {client_id}:")
+            logger.info(f"  └─ Generated audio: {len(audio_data)} bytes")
     except Exception as e:
-        print(f"Error in TTS websocket: {e}")
+        logger.error(f"TTS Error for {client_id}: {str(e)}")
     finally:
         del tts_connections[client_id]
+        logger.info(f"TTS Client disconnected: {client_id}")
 
 # Initialize models
 whisper_model = WhisperModel("base", device="cpu")
@@ -62,6 +112,9 @@ tts_model = Pipeline(s2a_ref='collabora/whisperspeech:s2a-q4-tiny-en+pl.model')
 
 @app.post("/stt")
 async def speech_to_text(audio: UploadFile = File(...)):
+    logger.info(f"HTTP STT Request:")
+    logger.info(f"  └─ File: {audio.filename} ({audio.content_type})")
+    
     # Save uploaded file temporarily
     temp_path = "temp_audio.wav"
     with open(temp_path, "wb") as buffer:
@@ -70,23 +123,29 @@ async def speech_to_text(audio: UploadFile = File(...)):
     
     # Transcribe
     segments, info = whisper_model.transcribe(temp_path)
-    
-    # Collect all text
     text = " ".join([segment.text for segment in segments])
     
     # Clean up
     Path(temp_path).unlink()
     
+    logger.info(f"HTTP STT Response:")
+    logger.info(f"  └─ Transcribed text: {text}")
     return {"text": text}
 
 @app.post("/tts")
 async def text_to_speech(text: str):
+    logger.info(f"HTTP TTS Request:")
+    logger.info(f"  └─ Input text: {text}")
+    
     # Generate audio
     audio_tensor = tts_model.generate(text)
     
     # Save audio
     output_path = "output.wav"
     torchaudio.save(output_path, audio_tensor.cpu(), 24000)
+    
+    logger.info(f"HTTP TTS Response:")
+    logger.info(f"  └─ Generated audio file: {output_path}")
     
     # Return audio file
     return FileResponse(
@@ -96,4 +155,5 @@ async def text_to_speech(text: str):
     )
 
 if __name__ == "__main__":
+    logger.info("Starting server on port 5001...")
     uvicorn.run(app, host="0.0.0.0", port=5001) 
