@@ -13,6 +13,9 @@ import wave
 from fastapi import WebSocketDisconnect
 import io
 from fastapi.middleware.cors import CORSMiddleware
+from scipy import signal
+import asyncio
+import time
 
 # Set up logging
 logging.basicConfig(
@@ -35,6 +38,15 @@ app.add_middleware(
 # Store active connections
 stt_connections: Dict[str, WebSocket] = {}
 tts_connections: Dict[str, WebSocket] = {}
+
+def resample_audio(audio_np, orig_sr=24000, target_sr=48000):
+    """Resample audio from original sample rate to target sample rate"""
+    # Calculate the number of samples after resampling
+    new_length = int(len(audio_np) * target_sr / orig_sr)
+    
+    # Resample using scipy's signal.resample
+    resampled = signal.resample(audio_np, new_length)
+    return resampled
 
 @app.websocket("/stt/ws/{client_id}")
 async def websocket_stt_endpoint(websocket: WebSocket, client_id: str):
@@ -108,26 +120,67 @@ async def websocket_tts_endpoint(websocket: WebSocket, client_id: str):
     await websocket.accept()
     tts_connections[client_id] = websocket
     logger.info(f"TTS Client connected: {client_id}")
+    
+    # Track last processed text to prevent duplicates
+    last_processed_text = None
+    last_processed_time = 0
+    
     try:
         while True:
             # Receive text
             data = await websocket.receive_json()
             text = data["text"]
+            current_time = time.time()
+            
+            # Skip if this is a duplicate request within 1 second
+            if text == last_processed_text and (current_time - last_processed_time) < 1.0:
+                logger.info(f"Skipping duplicate TTS request for text: {text}")
+                continue
+                
             logger.info(f"TTS Request from {client_id}:")
             logger.info(f"  └─ Input text: {text}")
             
             # Generate audio
             audio_tensor = tts_model.generate(text)
             
-            # Convert to bytes and send
-            audio_data = audio_tensor.cpu().numpy().tobytes()
+            # Convert to numpy array and ensure correct format
+            audio_np = audio_tensor.cpu().numpy()
+            
+            # Ensure audio is in the correct format (float32, mono)
+            if len(audio_np.shape) > 1:
+                audio_np = audio_np.mean(axis=0)  # Convert to mono if stereo
+            
+            # Normalize audio to prevent clipping
+            audio_np = np.clip(audio_np, -1.0, 1.0)
+            
+            # Resample from 24kHz to 48kHz
+            audio_np = resample_audio(audio_np, orig_sr=24000, target_sr=48000)
+            
+            # Convert to 16-bit PCM
+            audio_pcm = (audio_np * 32767).astype(np.int16)
+            
+            # Convert to bytes
+            audio_data = audio_pcm.tobytes()
+            
+            # Send audio data directly
             await websocket.send_bytes(audio_data)
+            
             logger.info(f"TTS Response to {client_id}:")
             logger.info(f"  └─ Generated audio: {len(audio_data)} bytes")
+            
+            # Update last processed text and time
+            last_processed_text = text
+            last_processed_time = current_time
+            
+            # Wait a bit before processing next request
+            await asyncio.sleep(0.1)
+            
     except Exception as e:
         logger.error(f"TTS Error for {client_id}: {str(e)}")
+        logger.exception("Full traceback:")
     finally:
-        del tts_connections[client_id]
+        if client_id in tts_connections:
+            del tts_connections[client_id]
         logger.info(f"TTS Client disconnected: {client_id}")
 
 # Initialize models
@@ -164,9 +217,29 @@ async def text_to_speech(text: str):
     # Generate audio
     audio_tensor = tts_model.generate(text)
     
-    # Save audio
+    # Convert to numpy array and ensure correct format
+    audio_np = audio_tensor.cpu().numpy()
+    
+    # Ensure audio is in the correct format (float32, mono)
+    if len(audio_np.shape) > 1:
+        audio_np = audio_np.mean(axis=0)  # Convert to mono if stereo
+    
+    # Normalize audio to prevent clipping
+    audio_np = np.clip(audio_np, -1.0, 1.0)
+    
+    # Resample from 24kHz to 48kHz
+    audio_np = resample_audio(audio_np, orig_sr=24000, target_sr=48000)
+    
+    # Convert to 16-bit PCM
+    audio_pcm = (audio_np * 32767).astype(np.int16)
+    
+    # Save audio with correct sample rate
     output_path = "output.wav"
-    torchaudio.save(output_path, audio_tensor.cpu(), 24000)
+    with wave.open(output_path, 'wb') as wav_file:
+        wav_file.setnchannels(1)  # Mono
+        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setframerate(48000)  # Target sample rate
+        wav_file.writeframes(audio_pcm.tobytes())
     
     logger.info(f"HTTP TTS Response:")
     logger.info(f"  └─ Generated audio file: {output_path}")
