@@ -12,6 +12,7 @@ from datetime import datetime
 import wave
 from fastapi import WebSocketDisconnect
 import io
+from fastapi.middleware.cors import CORSMiddleware
 
 # Set up logging
 logging.basicConfig(
@@ -22,55 +23,78 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
 # Store active connections
 stt_connections: Dict[str, WebSocket] = {}
 tts_connections: Dict[str, WebSocket] = {}
 
 @app.websocket("/stt/ws/{client_id}")
 async def websocket_stt_endpoint(websocket: WebSocket, client_id: str):
-    await websocket.accept()
-    stt_connections[client_id] = websocket
-    logger.info(f"STT Client connected: {client_id}")
     try:
+        await websocket.accept()
+        stt_connections[client_id] = websocket
+        logger.info(f"STT Client connected: {client_id}")
+        
         while True:
-            # Receive audio data as bytes
-            audio_data = await websocket.receive_bytes()
-            logger.info(f"STT Request from {client_id}:")
-            logger.info(f"  └─ Received audio: {len(audio_data)} bytes")
-            
-            # Convert raw PCM to WAV
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, 'wb') as wav_file:
-                wav_file.setnchannels(1)  # Mono audio from Unity
-                wav_file.setsampwidth(2)  # 16-bit audio
-                wav_file.setframerate(48000)  # Unity's sample rate
-                wav_file.writeframes(audio_data)
-            
-            # Save temporary WAV file
-            temp_path = f"temp_{client_id}.wav"
-            with open(temp_path, "wb") as f:
-                f.write(wav_buffer.getvalue())
-            
             try:
-                # Transcribe from file
-                logger.info(f"Processing audio file: {temp_path}")
-                segments, info = whisper_model.transcribe(temp_path)
-                text = " ".join([segment.text for segment in segments])
+                audio_data = await websocket.receive_bytes()
+                logger.info(f"STT Request from {client_id}:")
+                logger.info(f"  └─ Received audio: {len(audio_data)} bytes")
                 
-                if not text.strip():
-                    text = "[No speech detected]"
+                # Convert raw PCM to WAV
+                wav_buffer = io.BytesIO()
+                with wave.open(wav_buffer, 'wb') as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2)
+                    wav_file.setframerate(48000)
+                    wav_file.writeframes(audio_data)
                 
-                # Send back transcription
-                response = {"text": text}
-                await websocket.send_json(response)
-                logger.info(f"STT Response to {client_id}:")
-                logger.info(f"  └─ Transcribed text: {text}")
+                # Save temporary WAV file
+                temp_path = f"temp_{client_id}.wav"
+                with open(temp_path, "wb") as f:
+                    f.write(wav_buffer.getvalue())
                 
-            finally:
-                # Clean up
-                if Path(temp_path).exists():
-                    Path(temp_path).unlink()
+                try:
+                    # Transcribe from file
+                    logger.info(f"Processing audio file: {temp_path}")
+                    segments, info = whisper_model.transcribe(temp_path)
                     
+                    # Convert generator to list before joining
+                    segments_list = list(segments)  # Convert generator to list
+                    text = " ".join([segment.text for segment in segments_list])
+                    
+                    # Log the actual transcription result
+                    logger.info(f"Transcription result: '{text}' ({len(segments_list)} segments)")
+                    
+                    if not text.strip():
+                        text = "[No speech detected]"
+                    
+                    # Send back transcription and log the response
+                    response = {"text": text}
+                    await websocket.send_json(response)
+                    logger.info(f"STT Response sent to {client_id}:")
+                    logger.info(f"  └─ Transcribed text: {text}")
+                    
+                except Exception as e:
+                    logger.error(f"Transcription error: {str(e)}")
+                    await websocket.send_json({"error": str(e)})
+                finally:
+                    # Clean up
+                    if Path(temp_path).exists():
+                        Path(temp_path).unlink()
+                    
+            except WebSocketDisconnect:
+                logger.info(f"Client {client_id} disconnected")
+                break
+                
     except Exception as e:
         logger.error(f"STT Error for {client_id}: {str(e)}")
         logger.exception("Full traceback:")
