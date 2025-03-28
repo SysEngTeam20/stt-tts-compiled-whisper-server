@@ -1,3 +1,5 @@
 s2a-q4-hq-fast-en%2Bpl.model
 /venv
 output.wav
+/build
+/dist

@@ -56,3 +56,4 @@ uvicorn==0.34.0
 vocos==0.1.0
 webdataset==0.2.111
 WhisperSpeech==0.8.9
+pyinstaller==6.5.0
