@@ -33,8 +33,8 @@ A high-performance speech-to-text and text-to-speech server built with FastAPI, 
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/compiled-whisper.git
-cd compiled-whisper
+git clone https://github.com/SysEngTeam20/compiled-whisper-server.git
+cd compiled-whisper-server
 ```
 
 2. Create and activate a virtual environment:
